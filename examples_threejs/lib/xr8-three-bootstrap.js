@@ -2,12 +2,11 @@
  * xr8-three-bootstrap.js
  *
  * Shared bootstrap for raw Three.js r178 + XR8 image tracking.
- * Replaces 8frame / A-Frame with direct Three.js scene management
- * while keeping the 8th Wall engine for AR camera and image detection.
  *
- * Usage:
- *   import { startXR8, applyTargetPose } from './lib/xr8-three-bootstrap.js';
- *   const { scene, camera, renderer, clock } = await startXR8({ ... });
+ * Architecture:
+ *   - XR8 renders camera feed on the original <canvas>
+ *   - Three.js renders 3D on a separate transparent canvas on top
+ *   - XR8 pipeline provides camera pose + image-target data each frame
  */
 
 import * as THREE from 'three';
@@ -54,7 +53,6 @@ function removeLoadingOverlay() {
 
 /**
  * Apply an XR8 image-target pose to a Three.js Object3D.
- * detail = { position: {x,y,z}, rotation: {w,x,y,z}, scale: number }
  */
 export function applyTargetPose(obj, detail) {
   const { position, rotation, scale } = detail;
@@ -63,23 +61,37 @@ export function applyTargetPose(obj, detail) {
   obj.scale.set(scale, scale, scale);
 }
 
+/**
+ * Create a shadow-casting directional light meant to be added to a target group.
+ * Because it lives inside the group, it transforms with the image target automatically.
+ */
+export function createShadowLight(opts = {}) {
+  const {
+    color = 0xfff5e0,
+    intensity = 1.0,
+    position = [2, 4, 2],
+    mapSize = 1024,
+    frustum = 10,
+    bias = -0.002,
+  } = opts;
+  const light = new THREE.DirectionalLight(color, intensity);
+  light.position.set(...position);
+  light.castShadow = true;
+  light.shadow.mapSize.set(mapSize, mapSize);
+  light.shadow.camera.near = 0.01;
+  light.shadow.camera.far = 50;
+  light.shadow.camera.left = -frustum;
+  light.shadow.camera.right = frustum;
+  light.shadow.camera.top = frustum;
+  light.shadow.camera.bottom = -frustum;
+  light.shadow.bias = bias;
+  return light;
+}
+
 // ---------------------------------------------------------------------------
 // startXR8
 // ---------------------------------------------------------------------------
 
-/**
- * Initialize XR8 + Three.js and start the AR camera.
- *
- * @param {Object}            config
- * @param {HTMLCanvasElement}  config.canvas          – Target <canvas>
- * @param {Array}              config.imageTargets     – imageTargetData array for XR8
- * @param {boolean}           [config.disableWorldTracking=true]
- * @param {Function}          [config.onImageFound]    – (detail) => void
- * @param {Function}          [config.onImageUpdated]  – (detail) => void
- * @param {Function}          [config.onImageLost]     – (detail) => void
- * @param {Function}          [config.onRenderLoop]    – ({scene,camera,renderer,clock}, delta) => void
- * @returns {Promise<{scene: THREE.Scene, camera: THREE.PerspectiveCamera, renderer: THREE.WebGLRenderer, clock: THREE.Clock}>}
- */
 export async function startXR8(config) {
   const {
     canvas,
@@ -91,55 +103,78 @@ export async function startXR8(config) {
     onRenderLoop,
   } = config;
 
-  // Show loading overlay
-  const loadingOverlay = createLoadingOverlay();
+  createLoadingOverlay();
 
-  // Shared state populated in onStart
   const state = {
     scene: new THREE.Scene(),
-    camera: new THREE.PerspectiveCamera(60, 1, 0.01, 1000),
+    camera: new THREE.PerspectiveCamera(
+      60, window.innerWidth / window.innerHeight, 0.01, 1000
+    ),
     renderer: null,
     clock: new THREE.Clock(),
+    sun: null,
   };
+
+  // Track active image targets for found/lost detection
+  const activeTargets = new Set();
+  const _vec3 = new THREE.Vector3();
+  const _quat = new THREE.Quaternion();
 
   // ------ Three.js pipeline module ------
   const threejsModule = {
     name: 'custom-threejs',
 
-    onStart: ({ canvas: c, canvasWidth, canvasHeight, GLctx }) => {
-      // Create renderer sharing XR8's GL context
+    onStart: () => {
+      // Separate canvas for Three.js — avoids GL context conflicts with XR8
+      const threeCanvas = document.createElement('canvas');
+      threeCanvas.id = 'three-canvas';
+      threeCanvas.style.cssText =
+        'position:fixed; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:1;';
+      document.body.appendChild(threeCanvas);
+
       state.renderer = new THREE.WebGLRenderer({
-        canvas: c,
-        context: GLctx,
+        canvas: threeCanvas,
         alpha: true,
+        antialias: true,
       });
-      state.renderer.autoClear = false;
-      // Use window dimensions for fullscreen; pass false to not touch CSS
-      // (CSS handles the canvas sizing via position:fixed + 100%)
-      state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      state.renderer.setClearColor(0x000000, 0);
+      state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1));
       state.renderer.setSize(window.innerWidth, window.innerHeight, false);
 
-      // Camera aspect
-      state.camera.aspect = canvasWidth / canvasHeight;
-      state.camera.updateProjectionMatrix();
+      // Enable shadows
+      state.renderer.shadowMap.enabled = true;
+      state.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-      // Default lighting
-      state.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-      const dir = new THREE.DirectionalLight(0xffffff, 0.8);
-      dir.position.set(1, 2, 2);
-      state.scene.add(dir);
+      // Natural lighting: soft ambient + directional sun with shadows
+      const hemi = new THREE.HemisphereLight(0xddeeff, 0x332211, 0.6);
+      state.scene.add(hemi);
+
+      // Shadow light lives at scene level (always visible, never toggled
+      // by group.visible) so shadows survive lost/re-found cycles.
+      state.sun = new THREE.DirectionalLight(0xfff5e0, 1.0);
+      state.sun.position.set(2, 4, 2);
+      state.sun.castShadow = true;
+      state.sun.shadow.mapSize.set(1024, 1024);
+      state.sun.shadow.camera.near = 0.01;
+      state.sun.shadow.camera.far = 50;
+      state.sun.shadow.camera.left = -5;
+      state.sun.shadow.camera.right = 5;
+      state.sun.shadow.camera.top = 5;
+      state.sun.shadow.camera.bottom = -5;
+      state.sun.shadow.bias = -0.005;
+      state.scene.add(state.sun);
+      state.scene.add(state.sun.target);
 
       removeLoadingOverlay();
     },
 
     onUpdate: ({ processCpuResult }) => {
-      // XR8 provides the camera projection matrix from intrinsics
-      const realitySource =
-        processCpuResult && processCpuResult.reality;
+      if (!processCpuResult) return;
+
+      const realitySource = processCpuResult.reality;
       if (realitySource) {
         const { rotation, position, intrinsics } = realitySource;
 
-        // Apply camera pose from XR8
         if (rotation) {
           state.camera.quaternion.set(
             rotation.x, rotation.y, rotation.z, rotation.w
@@ -148,32 +183,66 @@ export async function startXR8(config) {
         if (position) {
           state.camera.position.set(position.x, position.y, position.z);
         }
-        // Apply intrinsic projection matrix if available
-        if (intrinsics) {
+        // Only apply intrinsics when all values are finite
+        if (intrinsics && !intrinsics.some(v => !Number.isFinite(v))) {
           state.camera.projectionMatrix.fromArray(intrinsics);
           state.camera.projectionMatrixInverse
             .copy(state.camera.projectionMatrix)
             .invert();
         }
+
+        // --- Image targets from detectedImages (per-frame, continuous) ---
+        const detected = realitySource.detectedImages;
+        if (detected) {
+          const currentNames = new Set();
+
+          for (const img of detected) {
+            currentNames.add(img.name);
+            if (!activeTargets.has(img.name)) {
+              // Newly found
+              activeTargets.add(img.name);
+              if (onImageFound) onImageFound(img);
+            } else {
+              // Still tracking
+              if (onImageUpdated) onImageUpdated(img);
+            }
+          }
+
+          // Check for lost targets
+          for (const name of activeTargets) {
+            if (!currentNames.has(name)) {
+              activeTargets.delete(name);
+              if (onImageLost) onImageLost({ name });
+            }
+          }
+
+          // Move scene-level shadow light to follow first tracked target
+          if (state.sun && detected.length > 0) {
+            const img = detected[0];
+            const p = img.position;
+            const q = _quat.set(img.rotation.x, img.rotation.y, img.rotation.z, img.rotation.w);
+            const offset = _vec3.set(1, 3, 1).applyQuaternion(q).multiplyScalar(img.scale);
+            state.sun.position.set(p.x + offset.x, p.y + offset.y, p.z + offset.z);
+            state.sun.target.position.set(p.x, p.y, p.z);
+            state.sun.target.updateMatrixWorld();
+          }
+        }
       }
 
-      // Per-frame user callback
       if (onRenderLoop) {
         const delta = state.clock.getDelta();
         onRenderLoop(state, delta);
       }
     },
 
-    onCanvasSizeChange: ({ canvasWidth, canvasHeight }) => {
+    onCanvasSizeChange: () => {
       if (!state.renderer) return;
-      state.renderer.setSize(canvasWidth, canvasHeight, false);
-      state.camera.aspect = canvasWidth / canvasHeight;
+      state.renderer.setSize(window.innerWidth, window.innerHeight, false);
+      state.camera.aspect = window.innerWidth / window.innerHeight;
       state.camera.updateProjectionMatrix();
     },
 
     onRender: () => {
-      // Clear only depth so the camera feed (drawn by GlTextureRenderer) stays
-      state.renderer.clearDepth();
       state.renderer.render(state.scene, state.camera);
     },
 
@@ -183,16 +252,36 @@ export async function startXR8(config) {
     },
   };
 
-  // ------ Image target event listeners ------
-  if (onImageFound) {
-    document.addEventListener('xrimagefound', (e) => onImageFound(e.detail));
-  }
-  if (onImageUpdated) {
-    document.addEventListener('xrimageupdated', (e) => onImageUpdated(e.detail));
-  }
-  if (onImageLost) {
-    document.addEventListener('xrimagelost', (e) => onImageLost(e.detail));
-  }
+  // ------ Image target pipeline module (listener fallback) ------
+  const imageTargetModule = {
+    name: 'image-target-events',
+    listeners: [
+      {
+        event: 'reality.imagefound',
+        process: ({ detail }) => {
+          if (detail && !activeTargets.has(detail.name)) {
+            activeTargets.add(detail.name);
+            if (onImageFound) onImageFound(detail);
+          }
+        },
+      },
+      {
+        event: 'reality.imageupdated',
+        process: ({ detail }) => {
+          if (detail && onImageUpdated) onImageUpdated(detail);
+        },
+      },
+      {
+        event: 'reality.imagelost',
+        process: ({ detail }) => {
+          if (detail) {
+            activeTargets.delete(detail.name);
+            if (onImageLost) onImageLost(detail);
+          }
+        },
+      },
+    ],
+  };
 
   // ------ Wait for XR8 engine ------
   await new Promise((resolve) => {
@@ -201,22 +290,21 @@ export async function startXR8(config) {
   });
 
   // ------ Configure & run ------
-  // Camera feed renderer (must be added first so it draws the background)
   XR8.addCameraPipelineModule(XR8.GlTextureRenderer.pipelineModule());
-
-  // Our Three.js module
   XR8.addCameraPipelineModule(threejsModule);
-
-  // XR tracking controller
+  XR8.addCameraPipelineModule(imageTargetModule);
   XR8.addCameraPipelineModule(XR8.XrController.pipelineModule());
 
-  // Configure image targets
   XR8.XrController.configure({
     disableWorldTracking,
     imageTargetData: imageTargets,
   });
 
-  // Start
+  // Size the XR8 canvas before run() so intrinsics use the correct aspect ratio
+  const dpr = Math.min(window.devicePixelRatio, 1);
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+
   XR8.run({ canvas });
 
   return state;
