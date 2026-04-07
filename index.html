@@ -18,7 +18,7 @@
         imageTargetData:[{
           "name": "my-poster",
           "type": "PLANAR",
-          "imagePath": "../assets/Targets/facade.png",
+          "imagePath": "../assets/Targets/maquette.png",
           "properties": {
             "left": 0, "top": 0,
             "width": 1394, "height": 1034,
@@ -41,8 +41,9 @@
 
     <!-- Preload image asset -->
     <a-assets>
-      <img id="dessin1" src="../assets/FRAC44109_1R817_07_2.jpg" crossorigin="anonymous">
-      <img id="dessin2" src="../assets/export1.png" crossorigin="anonymous">
+      <img id="dessin1" src="../assets/batiments.png" crossorigin="anonymous">
+      <img id="dessin2" src="../assets/herbe + arbres.png" crossorigin="anonymous">
+      <img id="dessin3" src="../assets/voitures.png" crossorigin="anonymous">
     </a-assets>
 
     <a-camera position="0 4 10"></a-camera>
@@ -53,10 +54,13 @@
            (perpendicular to the poster surface) with slight Z offsets -->
 
       <!-- Instance 1 — back layer -->
-      <a-image src="#dessin1" position="0.5 0.8 0" width="0.5" height="0.5" rotation="90 0 0"></a-image>
+      <a-image src="#dessin1" position="-0.1 0 0.05" width="1" height="0.85" rotation="0 0 270" scale="1.1 1.1 1.1"></a-image>
 
       <!-- Instance 2 — middle layer -->
-      <a-image src="#dessin2" position="0 0.3 0.3" width="0.5" height="0.5"></a-image>
+      <a-image src="#dessin2" position="-0.14 0 0.1" width="1" height="0.77" rotation="0 0 270" scale="1 1 1"></a-image>
+
+      <!-- Instance 3 — front layer -->
+      <a-image src="#dessin3" position="-0.16 0.05 0.2" width="1" height="0.77" rotation="0 0 270" scale="1 1 1"></a-image>
 
      
 
